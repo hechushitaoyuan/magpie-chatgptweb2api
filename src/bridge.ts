@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { WebError, abortError, checkAbort } from "./errors.js";
 import { type Options } from "./options.js";
 import { type BrowserEvent, type Completion } from "./protocol.js";
+import { type ImageRequest, type ImageResult } from "./image.js";
 
 class EventQueue implements AsyncIterableIterator<BrowserEvent> {
   private items: BrowserEvent[] = [];
@@ -156,6 +157,21 @@ export class BrowserBridge {
     try { this.send({ id, method: "complete", params: { profileId, completion } }); }
     catch (e) { this.finish(id); queue.fail(e as Error); }
     return queue;
+  }
+
+  async generateImage(profileId: string, request: ImageRequest, signal?: AbortSignal): Promise<ImageResult> {
+    checkAbort(signal);
+    await this.start();
+    checkAbort(signal);
+    return await this.rawCall("image", { profileId, request }, request.timeoutMs ?? this.options.imageTimeoutMs + 120_000, signal) as ImageResult;
+  }
+
+  /** Reads the picture the open conversation already shows; nothing is sent to the webpage. */
+  async latestImage(profileId: string, request: { outputDir: string; filename?: string }, signal?: AbortSignal): Promise<ImageResult> {
+    checkAbort(signal);
+    await this.start();
+    checkAbort(signal);
+    return await this.rawCall("imageLast", { profileId, request }, 180_000, signal) as ImageResult;
   }
 
   async close(): Promise<void> {

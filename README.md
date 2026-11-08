@@ -4,6 +4,8 @@
 
 **当前是实验原型，尚未发布到 npm。匿名文本已实测成功；Cookie 可恢复真实账号状态，普通 Edge 手动登录和网页聊天已由用户确认，插件账号文本调用尚未跑通完整回复。** 本地网页测试与真实上游测试是两件事，验证记录见 [docs/verification.md](docs/verification.md)。
 
+**本轮新增：网页生图。** 同一个登录浏览器会话另挂一个图像模型 `web-image`（Magpie 里是 `chatgpt-web/web-image`）与一个 agent 工具，Magpie 的 `/v1/images/generations` 与 `magpie tool generate_image` 都能把图取回本地文件；不走 OpenAI API、不走 Codex。设计与实测边界见 [docs/image.md](docs/image.md)。
+
 ## 本地试用
 
 需要 Node 22+。Magpie 自带的 Bun 负责插件运行。首次使用时插件会把匹配版本的 Chromium 自动下载到插件目录的 `.playwright-browsers`，不使用全局浏览器缓存。也可以配置已有的 Chrome/Edge，插件不会安装或删除它们。显式设置 `PLAYWRIGHT_BROWSERS_PATH` 的部署使用该外部缓存，不自动补装。
@@ -15,6 +17,7 @@ npm run browser:install
 npm run guest
 npm run chat -- --prompt '请用中文介绍一下自己'
 npm run doctor
+npm run image -- --prompt '一只戴帽子的猫' --size 16:9 --out /tmp/cat.png
 ```
 
 `guest` 打开独立匿名浏览器并验证输入框，成功后复用同一 profile，不按请求重置匿名会话。匿名入口是否可用以实际网页为准；若网页要求验证，在专用窗口中处理。匿名模式不代表拥有订阅模型权限。若自动下载受网络或权限限制失败，可先运行 `npm run browser:install`，或配置 `channel` / `executablePath`。
@@ -74,6 +77,23 @@ npm run chat -- --prompt '请只回复：Cookie 登录测试成功'
 
 Cookie 文件由本机 worker 读取，内容和源文件路径不写入 Magpie 账号存储，也不输出到日志。之后使用浏览器保存的会话，不重新读取导出文件。导出文件仍是凭据，应保存在仓库之外；会话 Cookie 是否跨重启保留取决于浏览器行为，插件保留原有过期属性，不人为延长有效期。
 
+## 网页生图
+
+`chatgpt-web/web-image` 是同一个登录会话的图片能力：Magpie 收到图像请求后，插件把提示词送进网页 composer，
+等助手回合渲染出图片，再把字节写成本地文件。另有 agent 工具
+`magpie-chatgptweb2api_chatgpt_web_generate_image`。**真实账号出图尚未验证**（本机没有网页登录态），
+DOM 选取器也尚未对登录后的真实页面验证；其余环节（取字节、落盘、失败分类、Magpie 路由）已实测。
+
+```sh
+npm run image -- --options /absolute/options.json --prompt '一只戴帽子的猫' --size 16:9 --out /tmp/cat.png
+HOME=/home/wuguo magpie settings set imageGen chatgpt-web/web-image
+HOME=/home/wuguo magpie tool generate_image "一只戴帽子的猫" -o /tmp/cat.png
+node examples/ari-image.mjs --gateway http://magpie:3425 --key "$ARI_KEY" --prompt '一只戴帽子的猫' --out /tmp/cat.png
+```
+
+配置键 `imageDir`、`imageTimeoutMs`、`imagePromptSuffix`、`imageFileName`；诊断键 `imageSelfTest`、`debugFile`。
+完整说明与限制见 [docs/image.md](docs/image.md)。
+
 ## 配置
 
 Magpie Plugins → Options 使用 JSON。CLI 可保存到一个本地文件，再通过 `--options /absolute/path/options.json` 使用。
@@ -93,6 +113,8 @@ Magpie Plugins → Options 使用 JSON。CLI 可保存到一个本地文件，�
 本机桌面登录无需 Cloudflare Tunnel。服务器的可见登录需要显示环境（如 Xvfb）和远程桌面（如 noVNC）；Tunnel 只提供受保护的远程访问，不安装浏览器、不改变浏览器访问 ChatGPT 的出站网络，也不解决上游验证。没有显示环境时，保持窗口模式返回 `browser_display_missing`。
 
 代理通过 `"proxy": "http://127.0.0.1:7890"` 显式设置，支持 HTTP/HTTPS/SOCKS5 的无账号密码 URL。浏览器不会自动继承 Magpie 的全局/账号代理。改变浏览器或代理选项后重启插件；同一机器上共享 profiles 目录的多个 worker 以 profile 文件锁串行，冲突返回 `account_busy`；异常退出的锁等待 30 秒后可恢复。请使用本机文件系统，不将同一 profiles 卷共享给独立服务器。
+
+插件声明两个模型：`web-current`（文本）与 `web-image`（生图）。`models` 选项只影响文本那一档。
 
 默认只有 `web-current`：使用网页当前选择，**不保证某个模型版本**。真实账号验证后可添加精确菜单项：
 
@@ -123,7 +145,10 @@ Magpie Plugins → Options 使用 JSON。CLI 可保存到一个本地文件，�
 | Cookie 登录 | 本地 JSON / 请求头文本导入独立账号 profile；验证账号后使用 |
 | max_tokens | 仅作为近似长度提示，不是硬 token 上限 |
 | temperature / top_p | 只接受默认 1；其他值拒绝 |
-| 工具、图片、附件、结构化输出 | 不支持；提交网页前返回 400 |
+| 文本会话里的工具、附件、结构化输出 | 不支持；提交网页前返回 400 |
+| 图片 | 走单独的图像模型 `web-image` / `chatgpt-web/web-image`，见 [docs/image.md](docs/image.md)；文本会话里仍不接受图片输入 |
+| 参考图 / 图片编辑 | 未实现（P4） |
+| GIF / 动图 | 未接入；网页生图工具只出静态图 |
 | token usage、额度、自动模型发现 | 暂不提供，不伪造计数或套餐能力 |
 
 短回复或只有一个段落的回复可能在完成后才输出。长回复按已稳定的段落和代码块逐块输出，不宣称原始 token 级流式。网页模式、登录挑战和页面结构可能随时变化。

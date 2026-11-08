@@ -11,6 +11,9 @@ const { values, positionals } = parseArgs({ allowPositionals: true, options: {
   options: { type: "string" }, profile: { type: "string" }, model: { type: "string", default: "web-current" },
   prompt: { type: "string" }, "prompt-file": { type: "string" },
   cookies: { type: "string" },
+  size: { type: "string" }, quality: { type: "string" }, out: { type: "string" },
+  n: { type: "string" }, filename: { type: "string" }, "prompt-suffix": { type: "string" },
+  "image-timeout": { type: "string" }, reference: { type: "string", multiple: true }, "extract-last": { type: "boolean" }, json: { type: "boolean" },
 } });
 const options = parseOptions(values.options ? JSON.parse(await readFile(values.options, "utf8")) : {});
 const bridge = new BrowserBridge(options);
@@ -34,7 +37,7 @@ try {
     await writeFile(selectedFile, JSON.stringify({ profileId }), { mode: 0o600 });
     process.stderr.write(`${guest ? "匿名会话已就绪" : "登录已完成"}。CLI profile: ${profileId}\n`);
     if (result.accountId && !guest) process.stderr.write("账号身份已验证，文本调用需另行测试。\n");
-  } else if (command === "doctor" || command === "chat") {
+  } else if (command === "doctor" || command === "chat" || command === "image") {
     let profileId = values.profile;
     if (!profileId) {
       try { profileId = JSON.parse(await readFile(selectedFile, "utf8")).profileId; }
@@ -44,6 +47,35 @@ try {
     if (command === "doctor") {
       const status = await bridge.call("status", { profileId }, ctl.signal);
       process.stdout.write(JSON.stringify(status, null, 2) + "\n");
+    } else if (command === "image") {
+      const prompt = values["prompt-file"] ? await readFile(values["prompt-file"], "utf8") : values.prompt ?? positionals.slice(1).join(" ");
+      if (!prompt && !values["extract-last"]) throw new WebError("Pass --prompt or --prompt-file", 400, "missing_prompt");
+      const count = values.n === undefined ? 1 : Number(values.n);
+      if (!Number.isSafeInteger(count) || count < 1 || count > 4) throw new WebError("--n must be 1–4", 400, "invalid_count");
+      const extra = values["image-timeout"] === undefined ? {} : { timeoutMs: Number(values["image-timeout"]) * 1000 };
+      if (values["image-timeout"] !== undefined && !Number.isFinite(extra.timeoutMs)) throw new WebError("--image-timeout must be a number of seconds", 400, "invalid_timeout");
+      const result = values["extract-last"]
+        ? await bridge.latestImage(profileId, { outputDir: values.out ?? options.imageDir, ...(values.filename ? { filename: values.filename } : {}) }, ctl.signal)
+        : await bridge.generateImage(profileId, {
+        prompt,
+        outputDir: values.out ?? options.imageDir,
+        model: values.model,
+        n: count,
+        ...(values.size ? { size: values.size } : {}),
+        ...(values.quality ? { quality: values.quality } : {}),
+        ...(values.filename ? { filename: values.filename } : {}),
+        ...(values["prompt-suffix"] ? { promptSuffix: values["prompt-suffix"] } : {}),
+        ...(values.reference?.length ? { references: values.reference.map(path => ({ path })) } : {}),
+        ...extra,
+      }, ctl.signal);
+      if (values.json) process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      else {
+        process.stderr.write(`网页模型：${result.modelLabel}｜耗时 ${(result.elapsedMs / 1000).toFixed(1)}s\n`);
+        for (const image of result.images) {
+          process.stdout.write(`${image.path}\t${image.width ?? "?"}x${image.height ?? "?"}\t${image.mimeType}\t${image.bytes} bytes\t${image.via}\n`);
+        }
+        for (const warning of result.warnings) process.stderr.write(`警告：${warning}\n`);
+      }
     } else {
       const prompt = values["prompt-file"] ? await readFile(values["prompt-file"], "utf8") : values.prompt ?? positionals.slice(1).join(" ");
       if (!prompt) throw new WebError("Pass --prompt or --prompt-file", 400, "missing_prompt");
@@ -59,7 +91,8 @@ try {
       process.stdout.write("\n");
     }
   } else {
-    process.stdout.write("chatgpt-web guest|login|doctor|chat [login --cookies /absolute/path/cookies.json | login --profile UUID] [--options file.json] [--profile UUID] [--model web-current] [--prompt text | --prompt-file path]\n");
+    process.stdout.write("chatgpt-web guest|login|doctor|chat|image [login --cookies /absolute/path/cookies.json | login --profile UUID] [--options file.json] [--profile UUID] [--model web-current] [--prompt text | --prompt-file path]\n"
+      + "  image: [--size 1024x1024|16:9|square] [--out DIR] [--n 1-4] [--quality high] [--filename base] [--reference /abs/img.png ...] [--prompt-suffix text] [--image-timeout seconds] [--json]\n");
   }
 } catch (e) {
   process.stderr.write(`${publicError(e).message}\n`);

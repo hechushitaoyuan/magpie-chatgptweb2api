@@ -26,6 +26,15 @@ export interface Options {
   contextLimit: number;
   outputLimit: number;
   models: ModelOption[];
+  /** Where generate_image writes its files when the caller names no directory. */
+  imageDir: string;
+  imageTimeoutMs: number;
+  imagePromptSuffix?: string;
+  imageFileName?: string;
+  /** Diagnostic: answer image requests with a locally drawn picture, never the browser. */
+  imageSelfTest: boolean;
+  /** Diagnostic: append every provider request this plugin receives to this file. */
+  debugFile?: string;
 }
 
 function integer(o: Record<string, unknown>, key: string, fallback: number, min: number, max: number): number {
@@ -42,14 +51,20 @@ export function defaultProfilesDir(): string {
   return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "magpie-chatgptweb2api", "profiles");
 }
 
+export function defaultImagesDir(): string {
+  if (process.platform === "darwin") return join(homedir(), "Library", "Application Support", "magpie-chatgptweb2api", "images");
+  if (process.platform === "win32") return join(process.env.LOCALAPPDATA || homedir(), "magpie-chatgptweb2api", "images");
+  return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "magpie-chatgptweb2api", "images");
+}
+
 export function parseOptions(input: unknown = {}): Options {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new WebError("Plugin options must be an object", 400, "invalid_options");
   const o = input as Record<string, unknown>;
-  const known = new Set(["internalReader", "browserMode", "profilesDir", "executablePath", "channel", "proxy", "headless", "timeoutMs", "loginTimeoutMs", "idleTimeoutMs", "pollMs", "settleMs", "maxPromptChars", "maxOutputChars", "contextLimit", "outputLimit", "models"]);
+  const known = new Set(["internalReader", "browserMode", "profilesDir", "executablePath", "channel", "proxy", "headless", "timeoutMs", "loginTimeoutMs", "idleTimeoutMs", "pollMs", "settleMs", "maxPromptChars", "maxOutputChars", "contextLimit", "outputLimit", "models", "imageDir", "imageTimeoutMs", "imagePromptSuffix", "imageFileName", "imageSelfTest", "debugFile"]);
   known.add("internalSender");
   known.add("remoteLoginUrl");
   for (const k of Object.keys(o)) if (!known.has(k)) throw new WebError(`Unknown plugin option: ${k}`, 400, "invalid_options");
-  for (const k of ["profilesDir", "executablePath", "proxy"]) if (o[k] !== undefined && (typeof o[k] !== "string" || !o[k].trim())) throw new WebError(`${k} must be a nonempty string`, 400, "invalid_options");
+  for (const k of ["profilesDir", "executablePath", "proxy", "imageDir", "debugFile"]) if (o[k] !== undefined && (typeof o[k] !== "string" || !o[k].trim())) throw new WebError(`${k} must be a nonempty string`, 400, "invalid_options");
   if (o.browserMode !== undefined && !["keep-open", "managed"].includes(o.browserMode as string)) throw new WebError("browserMode must be keep-open or managed", 400, "invalid_options");
   if (o.headless !== undefined && typeof o.headless !== "boolean") throw new WebError("headless must be a boolean", 400, "invalid_options");
   if (o.internalReader !== undefined && typeof o.internalReader !== "boolean") throw new WebError("internalReader must be a boolean", 400, "invalid_options");
@@ -61,6 +76,9 @@ export function parseOptions(input: unknown = {}): Options {
   }
   if (o.channel !== undefined && o.channel !== "chrome" && o.channel !== "msedge") throw new WebError("channel must be chrome or msedge", 400, "invalid_options");
   if (o.channel && o.executablePath) throw new WebError("Choose channel or executablePath", 400, "invalid_options");
+  if (o.imagePromptSuffix !== undefined && (typeof o.imagePromptSuffix !== "string" || o.imagePromptSuffix.length > 2_000)) throw new WebError("imagePromptSuffix must be a string of at most 2000 characters", 400, "invalid_options");
+  if (o.imageFileName !== undefined && (typeof o.imageFileName !== "string" || !o.imageFileName.trim() || o.imageFileName.length > 120)) throw new WebError("imageFileName must be a nonempty string of at most 120 characters", 400, "invalid_options");
+  if (o.imageSelfTest !== undefined && typeof o.imageSelfTest !== "boolean") throw new WebError("imageSelfTest must be a boolean", 400, "invalid_options");
   if (o.proxy) {
     let u: URL;
     try { u = new URL(o.proxy as string); } catch { throw new WebError("proxy must be a valid URL", 400, "invalid_options"); }
@@ -96,5 +114,11 @@ export function parseOptions(input: unknown = {}): Options {
     contextLimit: integer(o, "contextLimit", 16_384, 1, 200_000),
     outputLimit: integer(o, "outputLimit", 4_096, 1, 100_000),
     models: validated,
+    imageDir: resolve((o.imageDir as string | undefined) ?? defaultImagesDir()),
+    imageTimeoutMs: integer(o, "imageTimeoutMs", 360_000, 5_000, 1_800_000),
+    imagePromptSuffix: o.imagePromptSuffix as string | undefined,
+    imageFileName: o.imageFileName as string | undefined,
+    imageSelfTest: (o.imageSelfTest as boolean | undefined) ?? false,
+    debugFile: o.debugFile as string | undefined,
   };
 }

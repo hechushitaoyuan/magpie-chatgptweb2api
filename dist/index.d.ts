@@ -110,33 +110,35 @@ declare const _default: {
         };
         provider: {
             id: string;
-            models(): Promise<{
-                [k: string]: {
-                    id: string;
-                    name: string;
-                    api: {
-                        id: string;
-                        url: string;
-                        npm: string;
-                    };
-                    limit: {
-                        context: number;
-                        output: number;
-                    };
-                    capabilities: {
-                        reasoning: boolean;
-                        toolcall: boolean;
-                        attachment: boolean;
-                        input: {
-                            text: boolean;
-                            image: boolean;
-                        };
-                        output: {
-                            text: boolean;
-                        };
-                    };
+            models(): Promise<Record<string, unknown>>;
+        };
+        tool: {
+            chatgpt_web_generate_image: {
+                description: string;
+                args: {
+                    prompt: import("zod").ZodString;
+                    size: import("zod").ZodOptional<import("zod").ZodString>;
+                    quality: import("zod").ZodOptional<import("zod").ZodEnum<{
+                        auto: "auto";
+                        low: "low";
+                        medium: "medium";
+                        high: "high";
+                    }>>;
+                    n: import("zod").ZodOptional<import("zod").ZodNumber>;
+                    output_dir: import("zod").ZodOptional<import("zod").ZodString>;
+                    filename: import("zod").ZodOptional<import("zod").ZodString>;
+                    image: import("zod").ZodOptional<import("zod").ZodString>;
                 };
-            }>;
+                execute(args: {
+                    prompt: string;
+                    size?: string | undefined;
+                    quality?: "auto" | "low" | "medium" | "high" | undefined;
+                    n?: number | undefined;
+                    output_dir?: string | undefined;
+                    filename?: string | undefined;
+                    image?: string | undefined;
+                }, context: import("@opencode-ai/plugin").ToolContext): Promise<import("@opencode-ai/plugin").ToolResult>;
+            };
         };
     }>;
 };

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { SITE_URL } from "./options.js";
 import { WebError, checkAbort, delay } from "./errors.js";
 import { MarkdownStream, toMarkdown } from "./markdown.js";
+import { imagePrompt, saveImages, selfTestPayload, sniffMime } from "./image.js";
 import { connectKeptBrowser } from "./kept-browser.js";
 import { lockProfile } from "./profile-lock.js";
 import { readCookieFile } from "./cookies.js";
@@ -12,10 +13,14 @@ import { readInternalReply } from "./internal-reader.js";
 import { Submission } from "./submission.js";
 import { sendInternal } from "./internal-sender.js";
 import { managedBrowserExecutable } from "./browser-install.js";
-const COMPOSER = '[data-testid="prompt-textarea"], #prompt-textarea, textarea[data-mobile-composer-prompt], textarea[data-id="root"], [contenteditable="true"][data-lexical-editor="true"], form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]';
-const SEND = '[data-testid="send-button"], [data-testid="composer-submit-button"], button[data-composer-submit], form[data-chatgpt-composer] button[type="submit"], button[aria-label="Send prompt"], button[aria-label="发送提示"]';
-const STOP = '[data-testid="stop-button"], button[data-composer-submit]:has([data-composer-stop-icon]:not([hidden])), form[data-chatgpt-composer] button[aria-label="Stop"], button[aria-label="Stop generating"], button[aria-label="停止生成"]';
-const PICKER = '[data-testid="model-switcher-dropdown-button"], [data-testid="model-picker-dropdown-button"]';
+const COMPOSER = '[data-testid="prompt-textarea"], #prompt-textarea, textarea[data-mobile-composer-prompt], textarea[data-id="root"], [contenteditable="true"][data-lexical-editor="true"], form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"], [data-composer-markdown][contenteditable="true"][role="textbox"], div.ProseMirror[contenteditable="true"][role="textbox"]';
+const SEND = '[data-testid="send-button"], [data-testid="composer-submit-button"], button[data-composer-submit], form[data-chatgpt-composer] button[type="submit"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="发送提示"]';
+const STOP = '[data-testid="stop-button"], button[data-composer-submit]:has([data-composer-stop-icon]:not([hidden])), form[data-chatgpt-composer] button[aria-label="Stop"], button[aria-label="Stop generating"], button[aria-label="Stop"], button[aria-label="停止生成"]';
+const PICKER = '[data-testid="model-switcher-dropdown-button"], [data-testid="model-picker-dropdown-button"], button[aria-label="Select ChatGPT model"]';
+/** Hidden composer inputs the current web UI keeps mounted for photo/video attachments. */
+const ATTACH = 'input[type="file"][aria-label="Attach photos"], input[type="file"][aria-label="Attach photos or videos"], input[type="file"][accept^="image/"][multiple]';
+/** How long a second operation waits for the one holding this profile (bounded, never a retry loop). */
+const BUSY_WAIT_MS = 90_000;
 const PROFILE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export class BrowserRuntime {
     options;
@@ -59,8 +64,16 @@ export class BrowserRuntime {
         checkAbort(signal);
         if (this.closed)
             throw new WebError("The browser runtime is closing", 503, "runtime_closed");
-        if (this.busy.has(id))
-            throw new WebError("This account already has a browser operation in progress", 429, "account_busy");
+        // One profile, one browser: a second operation waits for the first instead of being turned
+        // away. The wait is bounded (the gateway probes the same profile for sign-in state), so a
+        // stuck operation still ends as a clear 429 rather than an endless retry.
+        const waitUntil = Date.now() + BUSY_WAIT_MS;
+        while (this.busy.has(id)) {
+            if (Date.now() >= waitUntil)
+                throw new WebError("This account already has a browser operation in progress", 429, "account_busy");
+            await delay(this.options.pollMs, signal);
+            checkAbort(signal);
+        }
         this.busy.add(id);
         const entry = this.entries.get(id);
         if (entry?.timer)
@@ -713,6 +726,507 @@ export class BrowserRuntime {
         // account. Never publish DONE while the browser cleanup still owns it.
         checkAbort(signal);
         yield { event: "done" };
+    }
+    /**
+     * Answers with a locally drawn picture, so the gateway's image routing and response parsing can
+     * be checked without signing in and without spending anyone's quota. Reached only while the
+     * `imageSelfTest` option is on, and every result says so.
+     */
+    async selfTestImage(id, request) {
+        const started = Date.now();
+        const rendered = imagePrompt({ ...request, promptSuffix: request.promptSuffix ?? this.options.imagePromptSuffix });
+        const images = await saveImages(request.outputDir || this.options.imageDir, [selfTestPayload()], request.filename ?? "chatgpt-web-selftest");
+        return {
+            success: true,
+            profileId: id,
+            model: request.model ?? "web-image",
+            modelLabel: "self-test (imageSelfTest is on; no webpage was used)",
+            prompt: rendered.prompt,
+            ...(rendered.ratio && request.size ? { requestedSize: request.size } : {}),
+            requestedCount: Math.max(1, Math.min(request.n ?? 1, 4)),
+            images,
+            text: "",
+            elapsedMs: Date.now() - started,
+            warnings: ["imageSelfTest is on: this picture was drawn locally, no ChatGPT webpage was used"],
+        };
+    }
+    /**
+     * Reads every assistant turn the page currently renders, with the images inside it. The
+     * bytes are only carried when `extract` is set, so the polling path stays small even while
+     * a data: URL is on screen.
+     */
+    async readImages(page, extract) {
+        const raw = await page.evaluate(async ({ wantBytes, chunk }) => {
+            const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+            // A generated picture is served from the page's own origin, an oaiusercontent asset or a
+            // blob/data URL. Icons, avatars and inline SVG placeholders are filtered out by size and
+            // scheme. Anything else (a UI sprite, a favicon) never sits at 96px or more.
+            const accepted = (src) => {
+                if (!src)
+                    return false;
+                if (/^data:image\/svg/i.test(src))
+                    return false;
+                if (/^data:image\//i.test(src))
+                    return true;
+                if (/^blob:/i.test(src))
+                    return true;
+                try {
+                    const u = new URL(src, location.href);
+                    if (u.protocol !== "https:" && u.protocol !== "http:")
+                        return false;
+                    return /(^|\.)oaiusercontent\.com$/.test(u.hostname) || /(^|\.)openai\.com$/.test(u.hostname) || u.origin === location.origin;
+                }
+                catch {
+                    return false;
+                }
+            };
+            const turns = [];
+            const push = (el, id) => { if (el && id && !turns.some(t => t.el === el))
+                turns.push({ el, id }); };
+            for (const group of document.querySelectorAll("[data-turn-key]")) {
+                const key = group.getAttribute("data-turn-key");
+                if (!key)
+                    continue;
+                if (!group.querySelector('[data-conversation-role="assistant"], [data-chatgpt-agent-turn-start]'))
+                    continue;
+                push(group, `group:assistant:${key}`);
+            }
+            for (const li of document.querySelectorAll('[data-conversation-transcript] li[id][data-message-role="assistant"]')) {
+                push(li, `mobile:assistant:${li.id}`);
+            }
+            for (const el of document.querySelectorAll('[data-message-author-role="assistant"]')) {
+                if (el.closest("[data-turn-key]"))
+                    continue;
+                const turn = el.closest("[data-turn-id]")?.getAttribute("data-turn-id") ?? el.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container");
+                const message = el.getAttribute("data-message-id") ?? el.closest("[data-message-id]")?.getAttribute("data-message-id");
+                const id = turn ? `turn:${turn}` : message ? `message:${message}` : "";
+                push(el.closest("article") ?? el.parentElement ?? el, id);
+            }
+            const encode = (buf) => {
+                let out = "";
+                for (let i = 0; i < buf.length; i += chunk)
+                    out += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + chunk)));
+                return btoa(out);
+            };
+            const result = [];
+            for (const { el, id } of turns) {
+                const nodes = [...el.querySelectorAll("img")].filter(node => {
+                    if (!visible(node))
+                        return false;
+                    const src = node.currentSrc || node.src || "";
+                    if (!accepted(src))
+                        return false;
+                    // The turn also renders the caller's uploaded reference and the account avatar. Those
+                    // are not drawings: a reference picture must never come back as the generated answer.
+                    const alt = (node.getAttribute("alt") ?? "").trim().toLowerCase();
+                    if (alt === "user attachment" || alt.includes("attachment") || alt.includes("avatar"))
+                        return false;
+                    return node.naturalWidth >= 96 && node.naturalHeight >= 96;
+                }).sort((a, b) => {
+                    const score = (node) => (/generated image/i.test(node.getAttribute("alt") ?? "") ? 0 : 1);
+                    return score(a) - score(b);
+                });
+                const images = [];
+                for (let index = 0; index < nodes.length; index++) {
+                    const node = nodes[index];
+                    const src = node.currentSrc || node.src || "";
+                    const key = src.startsWith("data:") ? `data:${src.length}` : src.slice(0, 400);
+                    const entry = {
+                        index, src, key,
+                        width: node.naturalWidth, height: node.naturalHeight,
+                        alt: (node.getAttribute("alt") ?? "").slice(0, 300),
+                    };
+                    if (wantBytes) {
+                        try {
+                            const response = await fetch(src, { credentials: "include" });
+                            if (!response.ok)
+                                entry.error = `HTTP ${response.status}`;
+                            else {
+                                const buffer = new Uint8Array(await response.arrayBuffer());
+                                if (buffer.byteLength === 0)
+                                    entry.error = "empty response";
+                                else if (buffer.byteLength > 48 * 1024 * 1024)
+                                    entry.error = "image exceeds 48 MiB";
+                                else {
+                                    entry.b64 = encode(buffer);
+                                    entry.mimeType = (response.headers.get("content-type") ?? "").split(";")[0].trim();
+                                    entry.bytes = buffer.byteLength;
+                                }
+                            }
+                        }
+                        catch (e) {
+                            entry.error = String(e?.message ?? e).slice(0, 200);
+                        }
+                    }
+                    images.push(entry);
+                }
+                result.push({ id, text: (el.textContent ?? "").slice(0, 4_000), images });
+            }
+            return result;
+        }, { wantBytes: extract, chunk: 0x8000 });
+        return raw;
+    }
+    /** The bytes of one candidate, read through the browser context when the page's own fetch is refused. */
+    async fetchImage(context, image) {
+        if (image.b64 && image.bytes) {
+            const bytes = Buffer.from(image.b64, "base64");
+            return { bytes, mimeType: image.mimeType || sniffMime(bytes) || "image/png", url: image.src, via: "page-fetch" };
+        }
+        if (/^blob:/i.test(image.src) || /^data:/i.test(image.src)) {
+            throw new WebError(`The page could not read the generated image (${image.error ?? "unknown error"}); blob and data URLs cannot be fetched outside the page`, 502, "image_bytes_unavailable");
+        }
+        try {
+            const response = await context.request.get(image.src, { timeout: 60_000 });
+            if (!response.ok())
+                throw new WebError(`the asset answered HTTP ${response.status()}`, 502, "image_fetch_failed");
+            const bytes = await response.body();
+            if (!bytes.length)
+                throw new WebError("the asset answered with no bytes", 502, "image_fetch_failed");
+            const mimeType = (response.headers()["content-type"] ?? "").split(";")[0].trim();
+            return { bytes, mimeType: mimeType || sniffMime(bytes) || "image/png", url: image.src, via: "context-request" };
+        }
+        catch (e) {
+            const detail = e instanceof WebError ? e.message : `the asset could not be read (${e?.message ?? e})`;
+            throw new WebError(`The generated image could not be downloaded: ${detail}`, 502, "image_fetch_failed");
+        }
+    }
+    /**
+     * Uploads the caller's reference pictures into the composer before the prompt is sent. The
+     * webpage keeps hidden `input[type=file]` elements mounted for photo/video attachments, so the
+     * upload goes through the same path a person uses; no request is made to any API endpoint.
+     */
+    /** Removes leftover attachment chips and text so a failed attempt cannot poison the next one. */
+    async clearComposer(page) {
+        const chips = page.locator('form button[aria-label^="Remove "]');
+        for (let i = 0, n = await chips.count().catch(() => 0); i < n && i < 8; i++) {
+            await chips.first().click({ timeout: 2_000 }).catch(() => { });
+            await delay(200);
+        }
+        const composer = page.locator(COMPOSER).filter({ visible: true }).first();
+        if (await composer.count().catch(() => 0)) {
+            await composer.click({ timeout: 5_000 }).catch(() => { });
+            await page.keyboard.press("Control+a").catch(() => { });
+            await page.keyboard.press("Backspace").catch(() => { });
+        }
+    }
+    /** True while the composer shows a failed attachment ("Upload failed"). */
+    async uploadFailed(page) {
+        const text = await page.locator("form").first().innerText().catch(() => "");
+        return /upload failed|上传失败|upload error/i.test(text);
+    }
+    async attachReferences(page, references, warnings) {
+        const input = page.locator(ATTACH).first();
+        if (!await input.count())
+            throw new WebError("The webpage composer has no image attachment input; the reference picture cannot be uploaded", 502, "reference_input_missing");
+        const chips = page.locator('form button[aria-label^="Remove "]');
+        for (const reference of references) {
+            const before = await chips.count().catch(() => 0);
+            try {
+                await input.setInputFiles(reference.path, { timeout: 30_000 });
+            }
+            catch (e) {
+                throw new WebError(`The reference picture could not be attached: ${e?.message ?? e}`, 502, "reference_upload_failed");
+            }
+            const deadline = Date.now() + 60_000;
+            let attached = false;
+            while (Date.now() < deadline) {
+                if (await this.uploadFailed(page)) {
+                    await this.clearComposer(page);
+                    throw new WebError("The webpage refused the reference picture (upload failed)", 502, "reference_upload_failed");
+                }
+                if (await chips.count().catch(() => before) > before) {
+                    attached = true;
+                    break;
+                }
+                await delay(this.options.pollMs);
+            }
+            if (!attached) {
+                await this.clearComposer(page);
+                throw new WebError("The webpage did not accept the reference picture", 502, "reference_upload_failed");
+            }
+        }
+        // The send button stays disabled while an upload is still in flight; wait for it, then let the
+        // attachment settle so the prompt and the picture travel in the same turn.
+        const send = page.locator(SEND).filter({ visible: true }).first();
+        const uploadDeadline = Date.now() + 60_000;
+        while (Date.now() < uploadDeadline) {
+            if (await this.uploadFailed(page)) {
+                await this.clearComposer(page);
+                throw new WebError("The webpage refused the reference picture (upload failed)", 502, "reference_upload_failed");
+            }
+            if (await send.isEnabled().catch(() => false))
+                break;
+            await delay(this.options.pollMs);
+        }
+        await delay(1_500);
+        warnings.push(`${references.length} reference picture(s) uploaded through the webpage composer`);
+    }
+    static IMAGE_REFUSAL = /(?:can'?t|cannot|unable to|won'?t|wasn'?t able to|not able to)\s+(?:generate|create|make|produce|draw)|content policy|violates? (?:our|the) (?:policies|usage)|无法(?:生成|创建|绘制|满足)|不能生成|违反.{0,8}(?:政策|规定)|未能生成|生成失败/i;
+    /**
+     * Text-to-image through the logged-in ChatGPT web image tool.
+     *
+     * This is the webpage route only: the prompt goes into the composer, the picture is read back
+     * out of the rendered assistant turn. No OpenAI API, Images API or Codex endpoint is used, and
+     * no browser session material leaves the dedicated profile.
+     */
+    async generateImage(id, request, signal) {
+        if (this.options.imageSelfTest)
+            return await this.selfTestImage(id, request);
+        signal = await this.acquire(id, signal);
+        const started = Date.now();
+        const warnings = [];
+        let page;
+        let completed = false;
+        let released = false;
+        let reused = false;
+        let stopOnAbort;
+        try {
+            checkAbort(signal);
+            const marker = await this.marker(id);
+            const entry = await this.context(id);
+            // Cloudflare hands a fresh tab a "Just a moment" challenge that never settles in a
+            // remote/headless display, while a tab the account already opened stays cleared.
+            // Reuse that warm tab when one exists and never navigate it away from the site.
+            const warm = entry.context.pages().find(p => !p.isClosed() && p.url().startsWith(this.origin));
+            page = warm ?? await entry.context.newPage();
+            reused = Boolean(warm);
+            const ownedPage = page;
+            stopOnAbort = () => {
+                void (async () => {
+                    const stop = ownedPage.locator(STOP).first();
+                    if (await stop.isVisible().catch(() => false))
+                        await stop.click({ timeout: 1_000 }).catch(() => { });
+                    if (!reused)
+                        await ownedPage.close().catch(() => { });
+                })();
+            };
+            signal?.addEventListener("abort", stopOnAbort, { once: true });
+            checkAbort(signal);
+            // Keep whatever picture the page already downloaded: a blob: URL or a signed
+            // oaiusercontent asset is not always readable a second time.
+            const captured = new Map();
+            const onResponse = (response) => {
+                void (async () => {
+                    try {
+                        const type = (response.headers()["content-type"] ?? "").toLowerCase();
+                        if (!type.startsWith("image/"))
+                            return;
+                        if (captured.size >= 8)
+                            return;
+                        const url = response.url();
+                        if (!url || captured.has(url))
+                            return;
+                        const body = await response.body();
+                        if (!body.length || body.length > 48 * 1024 * 1024)
+                            return;
+                        captured.set(url, { bytes: body, mimeType: type.split(";")[0].trim(), url, via: "network" });
+                    }
+                    catch { /* a blob: response has no readable body here */ }
+                })();
+            };
+            page.on("response", onResponse);
+            // Refused before the page is even read: the live anonymous landing page says sign-in is
+            // what unlocks image creation, so a guest profile can never answer this.
+            if (marker.mode === "guest")
+                throw new WebError("Image generation needs a signed-in ChatGPT account; the anonymous webpage session cannot draw pictures", 401, "image_requires_account");
+            if (!reused)
+                await page.goto(this.origin, { waitUntil: "domcontentloaded" });
+            await this.waitForComposer(page);
+            await this.requireAuth(id, page);
+            const modelId = request.model ?? this.options.models[0].id;
+            const label = await this.selectModel(page, modelId);
+            const rendered = imagePrompt({ ...request, promptSuffix: request.promptSuffix ?? this.options.imagePromptSuffix });
+            const baseline = await this.snapshot(page);
+            if (baseline.generating)
+                throw new WebError("A webpage response is already running", 409, "page_busy");
+            const seen = new Set(baseline.seen);
+            const baselineTurns = new Set((await this.readImages(page, false)).map(t => t.id));
+            // Every picture already on the page (the uploaded reference included) is excluded from the
+            // answer, so the request can only return what this turn produced.
+            const baselineImages = new Set((await this.readImages(page, false)).flatMap(t => t.images.map(i => i.src)));
+            const composer = await this.waitForComposer(page);
+            await this.clearComposer(page);
+            if (request.references?.length)
+                await this.attachReferences(page, request.references, warnings);
+            await composer.fill(rendered.prompt);
+            checkAbort(signal);
+            const send = page.locator(SEND).filter({ visible: true }).first();
+            if (!await send.isVisible())
+                throw new WebError("Cannot locate the webpage Send button; no message was sent", 502, "send_button_missing");
+            await send.click();
+            const timeout = Math.min(request.timeoutMs ?? this.options.imageTimeoutMs, this.options.imageTimeoutMs);
+            const deadline = Date.now() + timeout;
+            const acceptedDeadline = Math.min(deadline, Date.now() + 15_000);
+            let userId;
+            let assistantId;
+            let sawGenerating = false;
+            let signature = "";
+            let signatureSince = 0;
+            let turnText = "";
+            let extracting;
+            let stoppedAt = 0;
+            let lastTurnCount = 0;
+            while (Date.now() < deadline) {
+                checkAbort(signal);
+                if (page.isClosed())
+                    throw new WebError("The conversation window was closed", 502, "page_closed");
+                const snapshot = await this.snapshot(page);
+                this.checkAlerts(snapshot);
+                const fresh = [...new Set(snapshot.users.filter(v => !seen.has(v)))];
+                if (fresh.length > 1 || (userId && fresh.some(v => v !== userId)))
+                    throw new WebError("Another message appeared in this conversation; the request cannot be bound safely", 409, "ambiguous_turn");
+                if (!userId)
+                    userId = fresh[0];
+                if (!userId) {
+                    if (Date.now() > acceptedDeadline)
+                        throw new WebError("The webpage did not confirm a new user message; no automatic resend was attempted", 502, "send_unconfirmed");
+                    await delay(this.options.pollMs, signal);
+                    continue;
+                }
+                sawGenerating ||= snapshot.generating;
+                lastTurnCount = snapshot.assistants.filter(a => !seen.has(a.id)).length;
+                const turns = (await this.readImages(page, false)).map(t => ({ ...t, images: t.images.filter(i => !baselineImages.has(i.src)) }));
+                const unseen = turns.filter(t => !baselineTurns.has(t.id));
+                if (unseen.length > 1 || (assistantId && unseen.some(t => t.id !== assistantId)))
+                    throw new WebError("The webpage returned ambiguous assistant messages", 502, "ambiguous_response");
+                const turn = unseen[0];
+                if (turn) {
+                    assistantId ??= turn.id;
+                    turnText = turn.text;
+                    const next = turn.images.map(i => i.key).join("|");
+                    if (next !== signature) {
+                        signature = next;
+                        signatureSince = Date.now();
+                    }
+                    if (turn.images.length && !extracting) {
+                        const settled = !snapshot.generating && Date.now() - signatureSince >= this.options.settleMs;
+                        if (settled) {
+                            const extracted = await this.readImages(page, true);
+                            const full = extracted.find(t => t.id === turn.id);
+                            if (full?.images.length)
+                                extracting = full;
+                        }
+                    }
+                }
+                if (extracting) {
+                    completed = true;
+                    break;
+                }
+                if (!snapshot.generating) {
+                    if (!stoppedAt && (sawGenerating || (turn && turn.text)))
+                        stoppedAt = Date.now();
+                    // ChatGPT often writes a sentence, then calls the image tool. Give the page a grace
+                    // period before declaring that no picture is coming; it never outlasts the timeout.
+                    if (stoppedAt && Date.now() - stoppedAt > Math.min(25_000, Math.max(2_000, timeout / 4)))
+                        break;
+                }
+                else
+                    stoppedAt = 0;
+                await delay(this.options.pollMs, signal);
+            }
+            if (!extracting) {
+                const detail = turnText.replace(/\s+/g, " ").trim().slice(0, 400);
+                if (BrowserRuntime.IMAGE_REFUSAL.test(turnText))
+                    throw new WebError(`ChatGPT did not draw a picture; the webpage answered: ${detail || "(no text)"}`, 502, "image_refused");
+                if (!userId)
+                    throw new WebError("The webpage never confirmed the prompt; no image was read", 502, "send_unconfirmed");
+                if (Date.now() >= deadline)
+                    throw new WebError(`The webpage produced no image within ${Math.round(timeout / 1000)}s`, 504, "image_timeout");
+                throw new WebError(`The webpage answered without an image${detail ? `: ${detail}` : ""}`, 502, "image_not_generated");
+            }
+            const wanted = Math.max(1, Math.min(request.n ?? 1, 4));
+            const candidates = extracting.images.slice(0, wanted * 2);
+            const payloads = [];
+            for (const image of candidates) {
+                if (payloads.length >= wanted)
+                    break;
+                const cached = captured.get(image.src);
+                if (cached) {
+                    payloads.push(cached);
+                    continue;
+                }
+                try {
+                    payloads.push(await this.fetchImage(entry.context, image));
+                }
+                catch (e) {
+                    if (candidates.length - payloads.length <= 1 && payloads.length === 0)
+                        throw e;
+                    warnings.push(`one image could not be read: ${e.message}`);
+                }
+            }
+            if (!payloads.length)
+                throw new WebError("The webpage showed an image but none of its bytes could be read", 502, "image_unreadable");
+            const images = await saveImages(request.outputDir || this.options.imageDir, payloads, request.filename ?? this.options.imageFileName);
+            for (const image of images)
+                if (!image.width || !image.height)
+                    warnings.push(`${image.filename}: unknown picture dimensions`);
+            return {
+                success: true,
+                profileId: id,
+                model: modelId,
+                modelLabel: label,
+                prompt: rendered.prompt,
+                ...(rendered.ratio ? { requestedSize: request.size?.trim() ?? rendered.ratio } : {}),
+                requestedCount: wanted,
+                images,
+                text: turnText.replace(/\s+/g, " ").trim().slice(0, 2_000),
+                elapsedMs: Date.now() - started,
+                warnings,
+            };
+        }
+        finally {
+            if (stopOnAbort)
+                signal?.removeEventListener("abort", stopOnAbort);
+            if (page && !page.isClosed() && !completed) {
+                const stop = page.locator(STOP).first();
+                if (await stop.isVisible().catch(() => false))
+                    await stop.click({ timeout: 1_000 }).catch(() => { });
+            }
+            if (!completed && page && !page.isClosed())
+                await this.clearComposer(page).catch(() => { });
+            if (!reused)
+                await page?.close().catch(() => { });
+            if (!released)
+                await this.release(id);
+        }
+    }
+    /**
+     * Diagnostic read-back: saves the newest picture the open conversation already shows, without
+     * sending anything. It exists so the extraction step can be checked against a real page — the
+     * difference between "the webpage drew it" and "the plugin returned the caller's own upload".
+     */
+    async latestImage(id, request, signal) {
+        signal = await this.acquire(id, signal);
+        const started = Date.now();
+        let page;
+        let keptOpen = false;
+        try {
+            checkAbort(signal);
+            const entry = await this.context(id);
+            const warm = entry.context.pages().find(p => !p.isClosed() && p.url().startsWith(this.origin));
+            if (!warm)
+                throw new WebError("No ChatGPT tab is open in the dedicated browser", 404, "no_open_conversation");
+            page = warm;
+            keptOpen = true;
+            await this.waitForComposer(page);
+            const turns = (await this.readImages(page, true)).filter(t => t.images.length);
+            const turn = turns[turns.length - 1];
+            if (!turn)
+                throw new WebError("The open conversation shows no picture", 404, "no_image_in_conversation");
+            const image = turn.images[0];
+            const payload = await this.fetchImage(entry.context, image);
+            const images = await saveImages(request.outputDir || this.options.imageDir, [payload], request.filename ?? "chatgpt-web-last");
+            return {
+                success: true, profileId: id, model: "web-current", modelLabel: "read back from the open conversation",
+                prompt: "", requestedCount: 1, images, text: turn.text.replace(/\s+/g, " ").trim().slice(0, 2_000),
+                elapsedMs: Date.now() - started, warnings: ["read-back only: nothing was sent to the webpage"],
+            };
+        }
+        finally {
+            if (!keptOpen)
+                await page?.close().catch(() => { });
+            await this.release(id);
+        }
     }
     async close() {
         this.closed = true;

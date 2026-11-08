@@ -4,6 +4,7 @@ import { BrowserRuntime } from "./browser.js";
 import { parseOptions } from "./options.js";
 import { publicError, WebError } from "./errors.js";
 import { type Completion } from "./protocol.js";
+import { type ImageRequest } from "./image.js";
 
 let runtime: BrowserRuntime | undefined;
 let closing = false;
@@ -53,6 +54,8 @@ input.on("line", line => {
         case "guestBegin": result = await runtime.beginGuest(ctl.signal); break;
         case "guestWait": result = await runtime.waitGuest(String(p.profileId), ctl.signal); break;
         case "status": result = await runtime.status(String(p.profileId), ctl.signal); break;
+        case "image": result = await runtime.generateImage(String(p.profileId), p.request as ImageRequest, ctl.signal); break;
+        case "imageLast": result = await runtime.latestImage(String(p.profileId), p.request as { outputDir: string; filename?: string }, ctl.signal); break;
         case "complete":
           for await (const event of runtime.complete(String(p.profileId), p.completion as Completion, ctl.signal)) await send({ id, ...event });
           break;

@@ -83,6 +83,12 @@ input.on("line", line => {
                 case "status":
                     result = await runtime.status(String(p.profileId), ctl.signal);
                     break;
+                case "image":
+                    result = await runtime.generateImage(String(p.profileId), p.request, ctl.signal);
+                    break;
+                case "imageLast":
+                    result = await runtime.latestImage(String(p.profileId), p.request, ctl.signal);
+                    break;
                 case "complete":
                     for await (const event of runtime.complete(String(p.profileId), p.completion, ctl.signal))
                         await send({ id, ...event });

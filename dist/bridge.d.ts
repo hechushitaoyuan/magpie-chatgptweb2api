@@ -1,5 +1,6 @@
 import { type Options } from "./options.js";
 import { type BrowserEvent, type Completion } from "./protocol.js";
+import { type ImageRequest, type ImageResult } from "./image.js";
 export declare class BrowserBridge {
     private options;
     private site?;
@@ -20,5 +21,11 @@ export declare class BrowserBridge {
     private rawCall;
     call<T>(method: "loginBegin" | "cookieBegin" | "loginWait" | "guestBegin" | "guestWait" | "status", params: unknown, signal?: AbortSignal): Promise<T>;
     open(profileId: string, completion: Completion, signal?: AbortSignal): Promise<AsyncIterableIterator<BrowserEvent>>;
+    generateImage(profileId: string, request: ImageRequest, signal?: AbortSignal): Promise<ImageResult>;
+    /** Reads the picture the open conversation already shows; nothing is sent to the webpage. */
+    latestImage(profileId: string, request: {
+        outputDir: string;
+        filename?: string;
+    }, signal?: AbortSignal): Promise<ImageResult>;
     close(): Promise<void>;
 }

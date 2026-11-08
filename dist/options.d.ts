@@ -27,6 +27,16 @@ export interface Options {
     contextLimit: number;
     outputLimit: number;
     models: ModelOption[];
+    /** Where generate_image writes its files when the caller names no directory. */
+    imageDir: string;
+    imageTimeoutMs: number;
+    imagePromptSuffix?: string;
+    imageFileName?: string;
+    /** Diagnostic: answer image requests with a locally drawn picture, never the browser. */
+    imageSelfTest: boolean;
+    /** Diagnostic: append every provider request this plugin receives to this file. */
+    debugFile?: string;
 }
 export declare function defaultProfilesDir(): string;
+export declare function defaultImagesDir(): string;
 export declare function parseOptions(input?: unknown): Options;

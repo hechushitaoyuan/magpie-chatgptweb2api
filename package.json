@@ -33,7 +33,10 @@
     "guest": "npm run build && node dist/cli.js guest",
     "doctor": "npm run build && node dist/cli.js doctor",
     "chat": "npm run build && node dist/cli.js chat",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "image": "npm run build && node dist/cli.js image",
+    "image:login": "npm run build && node dist/cli.js login",
+    "image:doctor": "npm run build && node dist/cli.js doctor"
   },
   "engines": {
     "node": ">=22"
@@ -50,6 +53,7 @@
     "maxConcurrency": 1
   },
   "dependencies": {
+    "@opencode-ai/plugin": "^1.19.5",
     "playwright": "1.64.0",
     "proper-lockfile": "^4.1.2",
     "turndown": "7.2.0",

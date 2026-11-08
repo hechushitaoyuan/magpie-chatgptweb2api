@@ -227,6 +227,19 @@ export class BrowserBridge {
         }
         return queue;
     }
+    async generateImage(profileId, request, signal) {
+        checkAbort(signal);
+        await this.start();
+        checkAbort(signal);
+        return await this.rawCall("image", { profileId, request }, request.timeoutMs ?? this.options.imageTimeoutMs + 120_000, signal);
+    }
+    /** Reads the picture the open conversation already shows; nothing is sent to the webpage. */
+    async latestImage(profileId, request, signal) {
+        checkAbort(signal);
+        await this.start();
+        checkAbort(signal);
+        return await this.rawCall("imageLast", { profileId, request }, 180_000, signal);
+    }
     async close() {
         if (this.closed)
             return;

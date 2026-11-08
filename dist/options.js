@@ -18,17 +18,24 @@ export function defaultProfilesDir() {
         return join(process.env.LOCALAPPDATA || homedir(), "magpie-chatgptweb2api", "profiles");
     return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "magpie-chatgptweb2api", "profiles");
 }
+export function defaultImagesDir() {
+    if (process.platform === "darwin")
+        return join(homedir(), "Library", "Application Support", "magpie-chatgptweb2api", "images");
+    if (process.platform === "win32")
+        return join(process.env.LOCALAPPDATA || homedir(), "magpie-chatgptweb2api", "images");
+    return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "magpie-chatgptweb2api", "images");
+}
 export function parseOptions(input = {}) {
     if (!input || typeof input !== "object" || Array.isArray(input))
         throw new WebError("Plugin options must be an object", 400, "invalid_options");
     const o = input;
-    const known = new Set(["internalReader", "browserMode", "profilesDir", "executablePath", "channel", "proxy", "headless", "timeoutMs", "loginTimeoutMs", "idleTimeoutMs", "pollMs", "settleMs", "maxPromptChars", "maxOutputChars", "contextLimit", "outputLimit", "models"]);
+    const known = new Set(["internalReader", "browserMode", "profilesDir", "executablePath", "channel", "proxy", "headless", "timeoutMs", "loginTimeoutMs", "idleTimeoutMs", "pollMs", "settleMs", "maxPromptChars", "maxOutputChars", "contextLimit", "outputLimit", "models", "imageDir", "imageTimeoutMs", "imagePromptSuffix", "imageFileName", "imageSelfTest", "debugFile"]);
     known.add("internalSender");
     known.add("remoteLoginUrl");
     for (const k of Object.keys(o))
         if (!known.has(k))
             throw new WebError(`Unknown plugin option: ${k}`, 400, "invalid_options");
-    for (const k of ["profilesDir", "executablePath", "proxy"])
+    for (const k of ["profilesDir", "executablePath", "proxy", "imageDir", "debugFile"])
         if (o[k] !== undefined && (typeof o[k] !== "string" || !o[k].trim()))
             throw new WebError(`${k} must be a nonempty string`, 400, "invalid_options");
     if (o.browserMode !== undefined && !["keep-open", "managed"].includes(o.browserMode))
@@ -54,6 +61,12 @@ export function parseOptions(input = {}) {
         throw new WebError("channel must be chrome or msedge", 400, "invalid_options");
     if (o.channel && o.executablePath)
         throw new WebError("Choose channel or executablePath", 400, "invalid_options");
+    if (o.imagePromptSuffix !== undefined && (typeof o.imagePromptSuffix !== "string" || o.imagePromptSuffix.length > 2_000))
+        throw new WebError("imagePromptSuffix must be a string of at most 2000 characters", 400, "invalid_options");
+    if (o.imageFileName !== undefined && (typeof o.imageFileName !== "string" || !o.imageFileName.trim() || o.imageFileName.length > 120))
+        throw new WebError("imageFileName must be a nonempty string of at most 120 characters", 400, "invalid_options");
+    if (o.imageSelfTest !== undefined && typeof o.imageSelfTest !== "boolean")
+        throw new WebError("imageSelfTest must be a boolean", 400, "invalid_options");
     if (o.proxy) {
         let u;
         try {
@@ -99,5 +112,11 @@ export function parseOptions(input = {}) {
         contextLimit: integer(o, "contextLimit", 16_384, 1, 200_000),
         outputLimit: integer(o, "outputLimit", 4_096, 1, 100_000),
         models: validated,
+        imageDir: resolve(o.imageDir ?? defaultImagesDir()),
+        imageTimeoutMs: integer(o, "imageTimeoutMs", 360_000, 5_000, 1_800_000),
+        imagePromptSuffix: o.imagePromptSuffix,
+        imageFileName: o.imageFileName,
+        imageSelfTest: o.imageSelfTest ?? false,
+        debugFile: o.debugFile,
     };
 }
