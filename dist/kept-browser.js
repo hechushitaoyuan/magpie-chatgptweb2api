@@ -1,6 +1,6 @@
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
-import { access, readFile, lstat, open, unlink } from "node:fs/promises";
+import { access, readFile, lstat, open, readlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { WebError, delay } from "./errors.js";
@@ -46,6 +46,37 @@ async function endpoint(directory) {
         return undefined;
     }
 }
+/**
+ * True when the profile's Chrome lock belongs to a process that no longer exists.
+ *
+ * Chrome leaves `SingletonLock` (a `host-<pid>` symlink) and `DevToolsActivePort` behind when it
+ * is killed without a clean shutdown. The plugin then refuses to launch ("this profile is open
+ * without a plugin connection"), which surfaces to callers as a 409 even though nothing is
+ * running. Only a lock whose owner is provably gone is cleared — a live browser is never touched.
+ */
+export async function lockOwnerGone(directory) {
+    try {
+        const target = await readlink(join(directory, "SingletonLock"));
+        const pid = Number(target.slice(target.lastIndexOf("-") + 1));
+        if (!Number.isSafeInteger(pid) || pid <= 0)
+            return false;
+        try {
+            process.kill(pid, 0);
+            return false;
+        }
+        catch (e) {
+            return e.code === "ESRCH";
+        }
+    }
+    catch {
+        return false;
+    }
+}
+export async function clearStaleBrowserState(directory) {
+    for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"]) {
+        await unlink(join(directory, name)).catch(() => { });
+    }
+}
 export async function connectKeptBrowser(directory, options, site) {
     let ws = await endpoint(directory);
     if (!ws) {
@@ -88,7 +119,11 @@ export async function connectKeptBrowser(directory, options, site) {
             if (!ws) {
                 try {
                     await lstat(join(directory, "SingletonLock"));
-                    throw new WebError("This profile is open without a plugin connection. Keep using that window; close it yourself before reopening with keep-open mode", 409, "browser_connection_unavailable");
+                    if (!await lockOwnerGone(directory)) {
+                        throw new WebError("This profile is open without a plugin connection. Keep using that window; close it yourself before reopening with keep-open mode", 409, "browser_connection_unavailable");
+                    }
+                    // The owner is gone: Chrome was killed without cleaning up, so the lock is debris.
+                    await clearStaleBrowserState(directory);
                 }
                 catch (e) {
                     if (e.code !== "ENOENT")
@@ -97,7 +132,16 @@ export async function connectKeptBrowser(directory, options, site) {
                 if (process.platform === "linux" && !options.headless && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
                     throw new WebError("Visible browser login needs a desktop display; run on a desktop or configure Xvfb/noVNC for remote login", 503, "browser_display_missing");
                 }
-                const args = [`--user-data-dir=${directory}`, "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check"];
+                // Chrome launched for CDP still answers `navigator.webdriver === true` and carries
+                // --enable-automation, which Cloudflare's check refuses to clear: the browser then sits on
+                // "Just a moment…" forever and every page load fails. These two flags are what make the
+                // dedicated browser a browser ChatGPT will actually serve.
+                const args = [
+                    `--user-data-dir=${directory}`,
+                    "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+                    "--no-first-run", "--no-default-browser-check",
+                    "--disable-blink-features=AutomationControlled",
+                ];
                 if (options.headless)
                     args.push("--headless=new");
                 if (options.proxy)
@@ -138,6 +182,10 @@ export async function connectKeptBrowser(directory, options, site) {
         await browser.close();
         throw new WebError("Browser has no default profile context", 503, "browser_connection_unavailable");
     }
+    // Pages opened from here on hide the automation tell as well as the launch flag does.
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    }).catch(() => { });
     // For connectOverCDP, browser.close disconnects the transport. Never call
     // defaultContext.close: that could terminate the browser and login window.
     return { browser, context };
