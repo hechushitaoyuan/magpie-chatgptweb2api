@@ -17,6 +17,7 @@ export interface Runtime {
   open(profileId: string, completion: Completion, signal?: AbortSignal): Promise<AsyncIterableIterator<BrowserEvent>>;
   close(): Promise<void>;
   generateImage?(profileId: string, request: ImageRequest, signal?: AbortSignal): Promise<ImageResult>;
+  imageSession?(signal?: AbortSignal): Promise<unknown>;
 }
 function profileOf(auth?: Auth): string {
   if (auth?.type !== "api" || !auth.key?.startsWith("browser:")) throw new WebError("Sign in using the ChatGPT Web browser method", 401, "sign_in_required");
@@ -337,7 +338,11 @@ export function createPluginHooks(input: unknown = {}, runtime?: Runtime) {
       async usage(getAuth: () => Promise<Auth>) {
         try {
           const status = await bridge.call<{ authenticated: boolean; anonymous?: boolean; accountId?: string; modelLabel?: string }>("status", { profileId: profileOf(await getAuth()) });
-          return { plan: status.anonymous ? "ChatGPT Web 匿名会话" : "ChatGPT Web 浏览器会话", user: status.accountId, message: status.modelLabel ? `网页当前模型：${status.modelLabel}` : "网页会话可用；额度尚未查询" };
+          // The binding is read from disk: showing it must not open a browser or enter a chat.
+          const binding = await Promise.resolve(bridge.imageSession?.()).catch(() => undefined) as { bound?: boolean; title?: string; id?: string; source?: string } | undefined;
+          const where = binding?.bound ? `生图会话：${binding.title || binding.id}` : "生图会话：尚未绑定";
+          const model = status.modelLabel ? `网页当前模型：${status.modelLabel}` : "网页会话可用；额度尚未查询";
+          return { plan: status.anonymous ? "ChatGPT Web 匿名会话" : "ChatGPT Web 浏览器会话", user: status.accountId, message: `${model}；${where}` };
         } catch (e) {
           const error = publicError(e);
           return { error: error.message, signIn: error.status === 401 ? "expired" : "kept" };

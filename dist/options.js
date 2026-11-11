@@ -25,17 +25,26 @@ export function defaultImagesDir() {
         return join(process.env.LOCALAPPDATA || homedir(), "magpie-chatgptweb2api", "images");
     return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "magpie-chatgptweb2api", "images");
 }
+/** Splits the one-line `imageConversation` shorthand into the three explicit fields. */
+function conversationBinding(o) {
+    const shorthand = typeof o.imageConversation === "string" ? o.imageConversation.trim() : "";
+    const url = o.imageConversationUrl?.trim() || (/^https?:\/\//.test(shorthand) ? shorthand : undefined);
+    const id = o.imageConversationId?.trim()
+        || (shorthand && !url && /^[0-9a-fA-F-]{8,64}$/.test(shorthand) ? shorthand : undefined);
+    const title = o.imageConversationTitle?.trim() || (shorthand && !url && !id ? shorthand : "");
+    return { imageConversationTitle: title, ...(id ? { imageConversationId: id } : {}), ...(url ? { imageConversationUrl: url } : {}) };
+}
 export function parseOptions(input = {}) {
     if (!input || typeof input !== "object" || Array.isArray(input))
         throw new WebError("Plugin options must be an object", 400, "invalid_options");
     const o = input;
-    const known = new Set(["internalReader", "browserMode", "profilesDir", "executablePath", "channel", "proxy", "headless", "timeoutMs", "loginTimeoutMs", "idleTimeoutMs", "pollMs", "settleMs", "maxPromptChars", "maxOutputChars", "contextLimit", "outputLimit", "models", "imageDir", "imageTimeoutMs", "imagePromptSuffix", "imageFileName", "imageSelfTest", "debugFile"]);
+    const known = new Set(["internalReader", "browserMode", "profilesDir", "executablePath", "channel", "proxy", "headless", "timeoutMs", "loginTimeoutMs", "idleTimeoutMs", "pollMs", "settleMs", "maxPromptChars", "maxOutputChars", "contextLimit", "outputLimit", "models", "imageDir", "imageTimeoutMs", "imagePromptSuffix", "imageFileName", "imageSelfTest", "debugFile", "imageConversationTitle", "imageConversationId", "imageConversationUrl", "imageAllowNewChat", "imageSessionFile", "imageConversation"]);
     known.add("internalSender");
     known.add("remoteLoginUrl");
     for (const k of Object.keys(o))
         if (!known.has(k))
             throw new WebError(`Unknown plugin option: ${k}`, 400, "invalid_options");
-    for (const k of ["profilesDir", "executablePath", "proxy", "imageDir", "debugFile"])
+    for (const k of ["profilesDir", "executablePath", "proxy", "imageDir", "debugFile", "imageConversationId", "imageConversationUrl"])
         if (o[k] !== undefined && (typeof o[k] !== "string" || !o[k].trim()))
             throw new WebError(`${k} must be a nonempty string`, 400, "invalid_options");
     if (o.browserMode !== undefined && !["keep-open", "managed"].includes(o.browserMode))
@@ -67,6 +76,23 @@ export function parseOptions(input = {}) {
         throw new WebError("imageFileName must be a nonempty string of at most 120 characters", 400, "invalid_options");
     if (o.imageSelfTest !== undefined && typeof o.imageSelfTest !== "boolean")
         throw new WebError("imageSelfTest must be a boolean", 400, "invalid_options");
+    if (o.imageAllowNewChat !== undefined && typeof o.imageAllowNewChat !== "boolean")
+        throw new WebError("imageAllowNewChat must be a boolean", 400, "invalid_options");
+    if (o.imageConversationId !== undefined && (typeof o.imageConversationId !== "string" || !/^[0-9a-fA-F-]{8,64}$/.test(o.imageConversationId.trim())))
+        throw new WebError("imageConversationId must be a ChatGPT conversation id", 400, "invalid_options");
+    if (o.imageConversationUrl !== undefined) {
+        if (typeof o.imageConversationUrl !== "string")
+            throw new WebError("imageConversationUrl must be a string", 400, "invalid_options");
+        let u;
+        try {
+            u = new URL(o.imageConversationUrl.trim());
+        }
+        catch {
+            throw new WebError("imageConversationUrl must be a chatgpt.com conversation URL", 400, "invalid_options");
+        }
+        if (u.protocol !== "https:" || u.hostname !== "chatgpt.com" || !/^\/c\/[0-9a-fA-F-]{8,64}$/.test(u.pathname))
+            throw new WebError("imageConversationUrl must be a chatgpt.com conversation URL like https://chatgpt.com/c/<id>", 400, "invalid_options");
+    }
     if (o.proxy) {
         let u;
         try {
@@ -118,5 +144,10 @@ export function parseOptions(input = {}) {
         imageFileName: o.imageFileName,
         imageSelfTest: o.imageSelfTest ?? false,
         debugFile: o.debugFile,
+        // `imageConversation` is the shorthand the Magpie Options field uses; it takes a title, an id
+        // or a URL, whichever the operator pasted.
+        ...conversationBinding(o),
+        imageAllowNewChat: o.imageAllowNewChat ?? false,
+        imageSessionFile: resolve(o.imageSessionFile ?? join(resolve(o.profilesDir ?? defaultProfilesDir()), "image-session.json")),
     };
 }

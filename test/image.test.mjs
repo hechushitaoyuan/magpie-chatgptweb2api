@@ -1,60 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { join } from 'node:path';
 import { readFile, readdir } from 'node:fs/promises';
-import { deflateSync } from 'node:zlib';
 import { BrowserRuntime } from '../dist/browser.js';
 import { parseOptions } from '../dist/options.js';
 import { imageSize, sizeInstruction, imagePrompt, saveImages, extensionFor } from '../dist/image.js';
-import { temporaryDirectory, browserExecutable } from './helpers.mjs';
-
-/** A real PNG of the requested size, so the reader meets the same bytes a browser would hold. */
-export function png(width, height, rgb = [200, 30, 90]) {
-  const raw = Buffer.alloc((width * 3 + 1) * height);
-  for (let y = 0; y < height; y++) {
-    const row = y * (width * 3 + 1);
-    raw[row] = 0;
-    for (let x = 0; x < width; x++) {
-      raw[row + 1 + x * 3] = rgb[0];
-      raw[row + 2 + x * 3] = rgb[1];
-      raw[row + 3 + x * 3] = rgb[2];
-    }
-  }
-  const chunk = (type, data) => {
-    const head = Buffer.alloc(8);
-    head.writeUInt32BE(data.length, 0);
-    head.write(type, 4, 'ascii');
-    const body = Buffer.concat([head.subarray(4), data]);
-    const crc = Buffer.alloc(4);
-    crc.writeUInt32BE(crc32(body) >>> 0, 0);
-    return Buffer.concat([head, data, crc]);
-  };
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk('IHDR', ihdr),
-    chunk('IDAT', deflateSync(raw)),
-    chunk('IEND', Buffer.alloc(0)),
-  ]);
-}
-
-let table;
-function crc32(buffer) {
-  if (!table) {
-    table = new Int32Array(256);
-    for (let i = 0; i < 256; i++) {
-      let c = i;
-      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      table[i] = c;
-    }
-  }
-  let crc = -1;
-  for (const byte of buffer) crc = table[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-  return (crc ^ -1) >>> 0;
-}
+import { temporaryDirectory, browserExecutable, png } from './helpers.mjs';
 
 /**
  * A ChatGPT-shaped fixture that draws a picture instead of answering in text: the same
@@ -205,7 +157,7 @@ test('the webpage image tool returns a real file from a blob: URL', async t => {
   const temp = await temporaryDirectory();
   const site = await imageFixture();
   t.after(async () => { await site.close(); await temp.close(); });
-  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 30000, idleTimeoutMs: 1000 });
+  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, imageAllowNewChat: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 30000, idleTimeoutMs: 1000 });
   const runtime = new BrowserRuntime(options, site.url);
   t.after(() => runtime.close());
   const { profileId } = await runtime.beginLogin();
@@ -229,7 +181,7 @@ test('a signed https asset is read through the browser context', async t => {
   const site = await imageFixture();
   site.state.mode = 'asset';
   t.after(async () => { await site.close(); await temp.close(); });
-  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 30000, idleTimeoutMs: 1000 });
+  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, imageAllowNewChat: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 30000, idleTimeoutMs: 1000 });
   const runtime = new BrowserRuntime(options, site.url);
   t.after(() => runtime.close());
   const { profileId } = await runtime.beginLogin();
@@ -243,7 +195,7 @@ test('a refusal and an empty answer both fail loudly instead of returning nothin
   const temp = await temporaryDirectory();
   const site = await imageFixture();
   t.after(async () => { await site.close(); await temp.close(); });
-  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 6000, idleTimeoutMs: 1000 });
+  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, imageAllowNewChat: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 6000, idleTimeoutMs: 1000 });
   const runtime = new BrowserRuntime(options, site.url);
   t.after(() => runtime.close());
   const { profileId } = await runtime.beginLogin();
@@ -267,7 +219,7 @@ test('an upstream rate limit is reported as one, not as a missing picture', asyn
   const site = await imageFixture();
   site.state.mode = 'rate-limit';
   t.after(async () => { await site.close(); await temp.close(); });
-  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 6000, idleTimeoutMs: 1000 });
+  const options = parseOptions({ profilesDir: temp.path, executablePath: await browserExecutable(), headless: true, imageAllowNewChat: true, browserMode: 'managed', pollMs: 50, settleMs: 100, imageTimeoutMs: 6000, idleTimeoutMs: 1000 });
   const runtime = new BrowserRuntime(options, site.url);
   t.after(() => runtime.close());
   const { profileId } = await runtime.beginLogin();

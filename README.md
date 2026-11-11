@@ -91,8 +91,32 @@ HOME=/home/wuguo magpie tool generate_image "一只戴帽子的猫" -o /tmp/cat.
 node examples/ari-image.mjs --gateway http://magpie:3425 --key "$ARI_KEY" --prompt '一只戴帽子的猫' --out /tmp/cat.png
 ```
 
-配置键 `imageDir`、`imageTimeoutMs`、`imagePromptSuffix`、`imageFileName`；诊断键 `imageSelfTest`、`debugFile`。
-完整说明与限制见 [docs/image.md](docs/image.md)。
+### 专用会话绑定
+
+图片生成固定在一个**已存在的 ChatGPT 会话**里进行，不再新建、不再切到别的会话：
+
+```json
+{"imageConversationId": "6af180fa-16d4-83e8-b4a3-650f20808876",
+ "imageConversationTitle": "ari项目专用生图会话"}
+```
+
+- 优先用 `imageConversationId` / `imageConversationUrl`（稳定标识，不需要浏览器）；否则读回
+  `<profilesDir>/image-session.json` 里记住的绑定；再否则按 `imageConversationTitle` **解析一次**并写盘。
+- 图片请求使用该会话**自己的固定热标签页**（已打开就采用、不重新加载），其他标签页不碰，请求结束不关标签页。
+- 找不到会话、标题重名、标签页被挑战页替换 → 明确报错，**绝不新建会话**；未配置绑定时默认拒绝，
+  只有 `imageAllowNewChat: true` 才回到旧行为。
+- 文本聊天、`doctor`、`usage` 不碰这个热标签页。
+
+```sh
+npm run session -- --options /path/options.json                    # 只读状态
+npm run session -- --options /path/options.json --rebind           # 按配置解析并写盘
+npm run session -- --options /path/options.json --bind "会话标题"   # 按标题绑定
+npm run session -- --options /path/options.json --clear-challenge  # 修 Cloudflare 挑战循环
+npm run image -- --options /path/options.json --dry-run            # 零额度：只走到发送前
+```
+
+配置键 `imageDir`、`imageTimeoutMs`、`imagePromptSuffix`、`imageFileName`、`imageConversation*`、`imageAllowNewChat`、
+`imageSessionFile`；诊断键 `imageSelfTest`、`debugFile`。完整说明、实测证据与限制见 [docs/image.md](docs/image.md)。
 
 ## 配置
 

@@ -36,6 +36,16 @@ export interface Options {
     imageSelfTest: boolean;
     /** Diagnostic: append every provider request this plugin receives to this file. */
     debugFile?: string;
+    /** Exact title of the ChatGPT conversation image generation is bound to. */
+    imageConversationTitle: string;
+    /** Stable conversation id; when set it wins over the title. */
+    imageConversationId?: string;
+    /** Full conversation URL; when set it wins over the id. */
+    imageConversationUrl?: string;
+    /** Off by default: an unbound image request fails instead of quietly opening a new chat. */
+    imageAllowNewChat: boolean;
+    /** Where the resolved binding is kept, so a restart reuses it. */
+    imageSessionFile: string;
 }
 export declare function defaultProfilesDir(): string;
 export declare function defaultImagesDir(): string;

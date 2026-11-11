@@ -399,7 +399,11 @@ export function createPluginHooks(input = {}, runtime) {
             async usage(getAuth) {
                 try {
                     const status = await bridge.call("status", { profileId: profileOf(await getAuth()) });
-                    return { plan: status.anonymous ? "ChatGPT Web 匿名会话" : "ChatGPT Web 浏览器会话", user: status.accountId, message: status.modelLabel ? `网页当前模型：${status.modelLabel}` : "网页会话可用；额度尚未查询" };
+                    // The binding is read from disk: showing it must not open a browser or enter a chat.
+                    const binding = await Promise.resolve(bridge.imageSession?.()).catch(() => undefined);
+                    const where = binding?.bound ? `生图会话：${binding.title || binding.id}` : "生图会话：尚未绑定";
+                    const model = status.modelLabel ? `网页当前模型：${status.modelLabel}` : "网页会话可用；额度尚未查询";
+                    return { plan: status.anonymous ? "ChatGPT Web 匿名会话" : "ChatGPT Web 浏览器会话", user: status.accountId, message: `${model}；${where}` };
                 }
                 catch (e) {
                     const error = publicError(e);

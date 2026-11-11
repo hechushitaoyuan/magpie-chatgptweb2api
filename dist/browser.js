@@ -1,7 +1,7 @@
 import { chromium } from "playwright";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile, lstat } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rename, writeFile, lstat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { SITE_URL } from "./options.js";
 import { WebError, checkAbort, delay } from "./errors.js";
 import { MarkdownStream, toMarkdown } from "./markdown.js";
@@ -22,9 +22,12 @@ const ATTACH = 'input[type="file"][aria-label="Attach photos"], input[type="file
 /** How long a second operation waits for the one holding this profile (bounded, never a retry loop). */
 const BUSY_WAIT_MS = 90_000;
 const PROFILE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CONVERSATION_PATH = /^\/c\/([0-9a-zA-Z-]{8,64})\/?$/;
 export class BrowserRuntime {
     options;
     entries = new Map();
+    /** The one hot tab that serves image generation, per profile. Never used by text or probes. */
+    imageTabs = new Map();
     busy = new Set();
     leases = new Map();
     closed = false;
@@ -962,6 +965,316 @@ export class BrowserRuntime {
         warnings.push(`${references.length} reference picture(s) uploaded through the webpage composer`);
     }
     static IMAGE_REFUSAL = /(?:can'?t|cannot|unable to|won'?t|wasn'?t able to|not able to)\s+(?:generate|create|make|produce|draw)|content policy|violates? (?:our|the) (?:policies|usage)|无法(?:生成|创建|绘制|满足)|不能生成|违反.{0,8}(?:政策|规定)|未能生成|生成失败/i;
+    conversationUrl(id) {
+        return `${this.origin}/c/${id}`;
+    }
+    conversationIdOf(url) {
+        try {
+            const u = new URL(url);
+            if (u.origin !== this.origin)
+                return undefined;
+            return CONVERSATION_PATH.exec(u.pathname)?.[1];
+        }
+        catch {
+            return undefined;
+        }
+    }
+    async readImageSession() {
+        try {
+            const raw = JSON.parse(await readFile(this.options.imageSessionFile, "utf8"));
+            if (raw?.version !== 1 || typeof raw.id !== "string" || !CONVERSATION_PATH.test(`/c/${raw.id}`))
+                return undefined;
+            return raw;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    async writeImageSession(session) {
+        await mkdir(dirname(this.options.imageSessionFile), { recursive: true, mode: 0o700 });
+        const tmp = `${this.options.imageSessionFile}.tmp`;
+        await writeFile(tmp, JSON.stringify(session, null, 1), { mode: 0o600 });
+        await rename(tmp, this.options.imageSessionFile);
+    }
+    /** Titles of this account's conversations, read inside the page with the page's own session. */
+    async findConversationByTitle(page, title) {
+        return await page.evaluate(async (wanted) => {
+            const found = new Set();
+            for (const a of document.querySelectorAll('a[href^="/c/"]')) {
+                const href = a.getAttribute("href") ?? "";
+                if ((a.textContent ?? "").trim() === wanted && /^\/c\//.test(href))
+                    found.add(href.slice(3));
+            }
+            if (found.size)
+                return [...found];
+            // The sidebar is virtualised and can be stale; the page's own conversation list is not.
+            try {
+                const session = await (await fetch("/api/auth/session", { credentials: "same-origin" })).json();
+                const headers = session?.accessToken ? { authorization: `Bearer ${session.accessToken}` } : {};
+                for (let offset = 0; offset < 600; offset += 28) {
+                    const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=28&order=updated`, { credentials: "same-origin", headers });
+                    if (!r.ok)
+                        break;
+                    const j = await r.json();
+                    const items = j.items ?? [];
+                    for (const item of items)
+                        if ((item.title ?? "").trim() === wanted && item.id)
+                            found.add(item.id);
+                    if (!items.length || offset + 28 >= (j.total ?? 0))
+                        break;
+                }
+            }
+            catch { /* the sidebar result, if any, stands */ }
+            return [...found];
+        }, title);
+    }
+    /** A page showing the browser check instead of the chat is never used or sent into. */
+    async isChallenged(page) {
+        try {
+            return /^(?:Just a moment|请稍候|请稍等)/i.test(await page.title());
+        }
+        catch {
+            return true;
+        }
+    }
+    async resolveByTitle(probe, title) {
+        const ids = await this.findConversationByTitle(probe, title);
+        if (!ids.length)
+            throw new WebError(`ChatGPT has no conversation titled "${title}"; image generation will not open a new chat. Create it (or set imageConversationId) and retry`, 404, "image_conversation_not_found");
+        if (ids.length > 1)
+            throw new WebError(`ChatGPT has ${ids.length} conversations titled "${title}"; set imageConversationId to pick one`, 409, "image_conversation_ambiguous");
+        const session = { version: 1, id: ids[0], title, url: this.conversationUrl(ids[0]), resolvedAt: new Date().toISOString(), source: "title" };
+        await this.writeImageSession(session);
+        return session;
+    }
+    /**
+     * Decides which conversation image generation belongs to. An explicit id or URL wins; then the
+     * binding remembered on disk; only when neither exists is the title looked up once — through the
+     * page's own session — and written down, so later requests never look it up again.
+     *
+     * A title lookup is the only path that needs a page. It reads an already-open tab when there is
+     * one and never navigates it.
+     */
+    async resolveImageSession(context, override) {
+        // An explicit bind replaces the configured binding outright — a title given here must not be
+        // shadowed by an id that the options happen to carry.
+        const explicitUrl = override ? override.url : this.options.imageConversationUrl;
+        const explicitId = override ? override.id : this.options.imageConversationId;
+        const title = override ? (override.title ?? "") : this.options.imageConversationTitle;
+        if (explicitUrl) {
+            const id = this.conversationIdOf(explicitUrl);
+            const session = { version: 1, id, title: title || id, url: this.conversationUrl(id), resolvedAt: new Date().toISOString(), source: "url" };
+            await this.writeImageSession(session);
+            return session;
+        }
+        if (explicitId) {
+            const session = { version: 1, id: explicitId, title: title || explicitId, url: this.conversationUrl(explicitId), resolvedAt: new Date().toISOString(), source: "explicit" };
+            await this.writeImageSession(session);
+            return session;
+        }
+        const saved = await this.readImageSession();
+        // A binding is only stale when it was found *by title* and that title has since changed. One
+        // the operator named by id or URL stands until it is replaced by another explicit binding.
+        const staleTitle = saved?.source === "title" && Boolean(title) && Boolean(saved.title) && saved.title !== title;
+        if (saved && !override?.title && !staleTitle)
+            return saved;
+        if (!title) {
+            if (this.options.imageAllowNewChat)
+                return { version: 1, id: "", title: "", url: this.origin, resolvedAt: new Date().toISOString(), source: "explicit" };
+            throw new WebError("No image conversation is bound. Set imageConversationTitle (or imageConversationId / imageConversationUrl) to the ChatGPT conversation image generation must reuse", 400, "image_conversation_unbound");
+        }
+        const ctx = await context();
+        const open = ctx.pages().find(p => !p.isClosed() && p.url().startsWith(this.origin + "/"));
+        if (open) {
+            if (await this.isChallenged(open))
+                throw new WebError("The plugin browser is showing the browser check, so the bound conversation cannot be located; clear it in that window and retry", 403, "browser_verification_required");
+            return await this.resolveByTitle(open, title);
+        }
+        const opened = await ctx.newPage();
+        try {
+            await opened.goto(this.origin, { waitUntil: "domcontentloaded" });
+            if (await this.isChallenged(opened))
+                throw new WebError("The plugin browser was handed the browser check while looking for the bound conversation; clear it in that window and retry", 403, "browser_verification_required");
+            return await this.resolveByTitle(opened, title);
+        }
+        finally {
+            await opened.close().catch(() => { });
+        }
+    }
+    async composerVisible(page) {
+        return await page.locator(COMPOSER).filter({ visible: true }).first().isVisible().catch(() => false);
+    }
+    /** Waits for the bound conversation to be usable, naming a browser check as soon as it shows. */
+    async waitForBoundChat(page, timeoutMs = 30_000) {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            if (await this.isChallenged(page)) {
+                throw new WebError("The bound image conversation is showing the browser check instead of the chat; clear it in the plugin browser window (or run `session --clear-challenge`) and retry", 403, "browser_verification_required");
+            }
+            if (await this.composerVisible(page))
+                return;
+            if (Date.now() >= deadline) {
+                throw new WebError("The bound conversation has no usable chat input; check the plugin browser window", 403, "chat_unavailable");
+            }
+            await delay(500);
+        }
+    }
+    /** True when this tab is still the bound conversation and is not showing the browser check. */
+    async usableImageTab(page, session) {
+        if (!page || page.isClosed() || !session.id)
+            return false;
+        try {
+            if (this.conversationIdOf(page.url()) !== session.id)
+                return false;
+            return !await this.isChallenged(page);
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
+     * The bound conversation's own hot tab. An already-open tab is adopted so a page that already
+     * cleared the browser check is never reloaded; only when no tab holds it is one opened at the
+     * conversation URL. Other tabs are never touched, and no new conversation is ever created.
+     */
+    async dedicatedImageTab(profileId, context, session) {
+        const key = `${profileId}:${session.id}`;
+        let page = this.imageTabs.get(key);
+        if (!await this.usableImageTab(page, session))
+            page = undefined;
+        if (!page) {
+            for (const candidate of context.pages()) {
+                if (await this.usableImageTab(candidate, session)) {
+                    page = candidate;
+                    break;
+                }
+            }
+        }
+        if (!page) {
+            page = await context.newPage();
+            await page.goto(session.url, { waitUntil: "domcontentloaded" });
+        }
+        await page.bringToFront().catch(() => { });
+        await this.waitForBoundChat(page);
+        if (this.conversationIdOf(page.url()) !== session.id) {
+            throw new WebError(`The image tab is not on the bound conversation (${session.title}); nothing was sent`, 409, "image_conversation_left");
+        }
+        this.imageTabs.set(key, page);
+        return page;
+    }
+    /**
+     * Binds image generation now and writes it down. The value is a conversation URL, an id or a
+     * title; with none, the configured title is resolved. Nothing is ever created — an unknown
+     * conversation is an error.
+     */
+    async bindImageSession(profileId, value, signal) {
+        const trimmed = value?.trim();
+        const override = !trimmed ? undefined
+            : /^https?:\/\//.test(trimmed) ? { url: trimmed }
+                : /^[0-9a-fA-F-]{8,64}$/.test(trimmed) ? { id: trimmed }
+                    : { title: trimmed };
+        if (override?.url) {
+            // The operator pastes the address bar of the real conversation; only its id matters here.
+            let id;
+            try {
+                const parsed = new URL(override.url);
+                if (parsed.hostname === "chatgpt.com" || parsed.origin === this.origin)
+                    id = CONVERSATION_PATH.exec(parsed.pathname)?.[1];
+            }
+            catch { /* not a URL at all */ }
+            if (!id)
+                throw new WebError("The binding URL must look like https://chatgpt.com/c/<id>", 400, "invalid_conversation");
+            override.url = this.conversationUrl(id);
+        }
+        // An id, a URL or a binding already on disk needs no browser at all. Only a title lookup does,
+        // and only then is the profile locked and opened, so a plain re-bind never starts Chrome.
+        const noBrowser = async () => { throw new WebError("the binding needs no browser", 500, "needs_browser"); };
+        try {
+            return { ...await this.resolveImageSession(noBrowser, override), profileId };
+        }
+        catch (e) {
+            if (!(e instanceof WebError) || e.code !== "needs_browser")
+                throw e;
+        }
+        signal = await this.acquire(profileId, signal);
+        try {
+            const entry = await this.context(profileId);
+            const session = await this.resolveImageSession(async () => entry.context, override);
+            return { ...session, profileId };
+        }
+        finally {
+            await this.release(profileId);
+        }
+    }
+    /**
+     * Walks the whole image route and stops before anything is typed: which conversation is bound,
+     * whether its tab was adopted or opened, whether the account and the composer are usable, and
+     * what the conversation already holds. It never sends and never creates a conversation, so it
+     * costs no picture quota.
+     */
+    async inspectImageRoute(profileId, signal) {
+        signal = await this.acquire(profileId, signal);
+        try {
+            const entry = await this.context(profileId);
+            const session = await this.resolveImageSession(async () => entry.context);
+            if (!session.id)
+                return { bound: false, source: session.source };
+            const before = entry.context.pages().filter(p => !p.isClosed() && this.conversationIdOf(p.url()) === session.id).length;
+            const page = await this.dedicatedImageTab(profileId, entry.context, session);
+            const adopted = before > 0;
+            const auth = await this.requireAuth(profileId, page);
+            const snapshot = await this.snapshot(page);
+            const turns = await this.readImages(page, false);
+            const picker = page.locator(PICKER).first();
+            const modelLabel = await picker.isVisible().catch(() => false) ? (await picker.innerText()).trim() : undefined;
+            return {
+                bound: true, id: session.id, title: session.title, url: session.url, source: session.source,
+                tab: adopted ? "adopted" : "opened", pageTitle: await page.title(),
+                authenticated: auth.authenticated, accountId: auth.accountId,
+                composer: await page.locator(COMPOSER).filter({ visible: true }).first().isVisible().catch(() => false),
+                sendReady: snapshot.sendReady,
+                turns: turns.length,
+                images: turns.reduce((sum, turn) => sum + turn.images.length, 0),
+                ...(modelLabel ? { modelLabel } : {}),
+            };
+        }
+        finally {
+            await this.release(profileId);
+        }
+    }
+    /**
+     * Clears only Cloudflare's own cookies for this site. Measured 2026-11-09: a profile whose
+     * clearance cookies were issued to an earlier browser build loops on "Just a moment…" forever,
+     * and dropping these five makes the very next load answer immediately. Sign-in cookies are not
+     * touched, so the account stays signed in.
+     */
+    async clearBrowserChallenge(profileId, signal) {
+        signal = await this.acquire(profileId, signal);
+        try {
+            const entry = await this.context(profileId);
+            const cookies = await entry.context.cookies(this.origin);
+            const targets = cookies.filter(c => /^(cf_clearance|__cf_bm|__cflb|_cfuvid|cf_chl_rc_ni|cf_chl_rc_i|cf_chl_2|cf_chl_prog)$/.test(c.name));
+            for (const cookie of targets)
+                await entry.context.clearCookies({ name: cookie.name });
+            return { cleared: targets.map(c => c.name) };
+        }
+        finally {
+            await this.release(profileId);
+        }
+    }
+    /** What image generation is bound to, without opening a browser. */
+    async imageSessionStatus() {
+        const saved = await this.readImageSession();
+        const configured = {
+            title: this.options.imageConversationTitle,
+            ...(this.options.imageConversationId ? { id: this.options.imageConversationId } : {}),
+            ...(this.options.imageConversationUrl ? { url: this.options.imageConversationUrl } : {}),
+            allowNewChat: this.options.imageAllowNewChat,
+        };
+        if (!saved)
+            return { bound: false, configured };
+        return { bound: true, id: saved.id, title: saved.title, url: saved.url, source: saved.source, resolvedAt: saved.resolvedAt, configured };
+    }
     /**
      * Text-to-image through the logged-in ChatGPT web image tool.
      *
@@ -979,24 +1292,26 @@ export class BrowserRuntime {
         let completed = false;
         let released = false;
         let reused = false;
+        let boundId;
         let stopOnAbort;
         try {
             checkAbort(signal);
             const marker = await this.marker(id);
             const entry = await this.context(id);
-            // Cloudflare hands a fresh tab a "Just a moment" challenge that never settles in a
-            // remote/headless display, while a tab the account already opened stays cleared.
-            // Reuse that warm tab when one exists and never navigate it away from the site.
-            const warm = entry.context.pages().find(p => !p.isClosed() && p.url().startsWith(this.origin));
-            page = warm ?? await entry.context.newPage();
-            reused = Boolean(warm);
+            // Image generation runs in the conversation it is bound to — never a new chat, never
+            // whichever tab happens to be open elsewhere. The bound tab is kept warm between requests,
+            // so a page that already cleared the browser check is not reloaded.
+            const session = await this.resolveImageSession(async () => entry.context);
+            boundId = session.id || undefined;
+            page = session.id ? await this.dedicatedImageTab(id, entry.context, session) : await entry.context.newPage();
+            reused = Boolean(session.id);
             const ownedPage = page;
             stopOnAbort = () => {
                 void (async () => {
                     const stop = ownedPage.locator(STOP).first();
                     if (await stop.isVisible().catch(() => false))
                         await stop.click({ timeout: 1_000 }).catch(() => { });
-                    if (!reused)
+                    if (!boundId)
                         await ownedPage.close().catch(() => { });
                 })();
             };
@@ -1029,7 +1344,7 @@ export class BrowserRuntime {
             // what unlocks image creation, so a guest profile can never answer this.
             if (marker.mode === "guest")
                 throw new WebError("Image generation needs a signed-in ChatGPT account; the anonymous webpage session cannot draw pictures", 401, "image_requires_account");
-            if (!reused)
+            if (!boundId)
                 await page.goto(this.origin, { waitUntil: "domcontentloaded" });
             await this.waitForComposer(page);
             await this.requireAuth(id, page);

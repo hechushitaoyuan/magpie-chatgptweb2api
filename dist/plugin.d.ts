@@ -12,6 +12,7 @@ export interface Runtime {
     open(profileId: string, completion: Completion, signal?: AbortSignal): Promise<AsyncIterableIterator<BrowserEvent>>;
     close(): Promise<void>;
     generateImage?(profileId: string, request: ImageRequest, signal?: AbortSignal): Promise<ImageResult>;
+    imageSession?(signal?: AbortSignal): Promise<unknown>;
 }
 export declare function createPluginHooks(input?: unknown, runtime?: Runtime): {
     config: (cfg: {

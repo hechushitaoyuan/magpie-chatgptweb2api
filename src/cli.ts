@@ -14,6 +14,7 @@ const { values, positionals } = parseArgs({ allowPositionals: true, options: {
   size: { type: "string" }, quality: { type: "string" }, out: { type: "string" },
   n: { type: "string" }, filename: { type: "string" }, "prompt-suffix": { type: "string" },
   "image-timeout": { type: "string" }, reference: { type: "string", multiple: true }, "extract-last": { type: "boolean" }, json: { type: "boolean" },
+  bind: { type: "string" }, rebind: { type: "boolean" }, "dry-run": { type: "boolean" }, "clear-challenge": { type: "boolean" },
 } });
 const options = parseOptions(values.options ? JSON.parse(await readFile(values.options, "utf8")) : {});
 const bridge = new BrowserBridge(options);
@@ -37,6 +38,27 @@ try {
     await writeFile(selectedFile, JSON.stringify({ profileId }), { mode: 0o600 });
     process.stderr.write(`${guest ? "匿名会话已就绪" : "登录已完成"}。CLI profile: ${profileId}\n`);
     if (result.accountId && !guest) process.stderr.write("账号身份已验证，文本调用需另行测试。\n");
+  } else if (command === "session") {
+    // Read-only by default: it prints what image generation is bound to, or resolves the
+    // configured title once and writes it down. It never creates a conversation.
+    let profileId = values.profile;
+    if (!profileId) {
+      try { profileId = JSON.parse(await readFile(selectedFile, "utf8")).profileId; }
+      catch { throw new WebError("No CLI browser profile. Run npm run login first, or pass --profile", 401, "sign_in_required"); }
+    }
+    if (!profileId) throw new WebError("Invalid CLI account marker", 401, "invalid_profile");
+    if (values["clear-challenge"]) {
+      const cleared = await bridge.clearBrowserChallenge(profileId, ctl.signal);
+      process.stdout.write(JSON.stringify(cleared, null, 2) + "\n");
+    } else {
+    const wantBind = values.rebind === true || values.bind !== undefined;
+    const result = wantBind
+      ? await bridge.bindImageSession(profileId, values.bind, ctl.signal) as Record<string, unknown>
+      : await bridge.imageSession(ctl.signal) as Record<string, unknown>;
+    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    const bound = (result as { bound?: boolean }).bound ?? Boolean((result as { id?: string }).id);
+    if (!bound) process.exitCode = 1;
+    }
   } else if (command === "doctor" || command === "chat" || command === "image") {
     let profileId = values.profile;
     if (!profileId) {
@@ -47,6 +69,11 @@ try {
     if (command === "doctor") {
       const status = await bridge.call("status", { profileId }, ctl.signal);
       process.stdout.write(JSON.stringify(status, null, 2) + "\n");
+    } else if (command === "image" && values["dry-run"]) {
+      // Nothing is typed and nothing is sent: this only proves where a request would go.
+      const route = await bridge.inspectImageRoute(profileId, ctl.signal);
+      process.stdout.write(JSON.stringify(route, null, 2) + "\n");
+      if (!(route as { bound?: boolean }).bound) process.exitCode = 1;
     } else if (command === "image") {
       const prompt = values["prompt-file"] ? await readFile(values["prompt-file"], "utf8") : values.prompt ?? positionals.slice(1).join(" ");
       if (!prompt && !values["extract-last"]) throw new WebError("Pass --prompt or --prompt-file", 400, "missing_prompt");
@@ -91,8 +118,9 @@ try {
       process.stdout.write("\n");
     }
   } else {
-    process.stdout.write("chatgpt-web guest|login|doctor|chat|image [login --cookies /absolute/path/cookies.json | login --profile UUID] [--options file.json] [--profile UUID] [--model web-current] [--prompt text | --prompt-file path]\n"
-      + "  image: [--size 1024x1024|16:9|square] [--out DIR] [--n 1-4] [--quality high] [--filename base] [--reference /abs/img.png ...] [--prompt-suffix text] [--image-timeout seconds] [--json]\n");
+    process.stdout.write("chatgpt-web guest|login|doctor|chat|image|session [login --cookies /absolute/path/cookies.json | login --profile UUID] [--options file.json] [--profile UUID] [--model web-current] [--prompt text | --prompt-file path]\n"
+      + "  session: [--bind <title|id|url> | --rebind | --clear-challenge] — show, set, or repair the bound conversation\n"
+      + "  image: [--size 1024x1024|16:9|square] [--out DIR] [--n 1-4] [--quality high] [--filename base] [--reference /abs/img.png ...] [--prompt-suffix text] [--image-timeout seconds] [--dry-run] [--json]\n");
   }
 } catch (e) {
   process.stderr.write(`${publicError(e).message}\n`);

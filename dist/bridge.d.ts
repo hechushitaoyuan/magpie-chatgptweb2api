@@ -27,5 +27,9 @@ export declare class BrowserBridge {
         outputDir: string;
         filename?: string;
     }, signal?: AbortSignal): Promise<ImageResult>;
+    imageSession(signal?: AbortSignal): Promise<unknown>;
+    clearBrowserChallenge(profileId: string, signal?: AbortSignal): Promise<unknown>;
+    inspectImageRoute(profileId: string, signal?: AbortSignal): Promise<unknown>;
+    bindImageSession(profileId: string, value: string | undefined, signal?: AbortSignal): Promise<unknown>;
     close(): Promise<void>;
 }

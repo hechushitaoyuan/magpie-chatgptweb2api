@@ -89,6 +89,18 @@ input.on("line", line => {
                 case "imageLast":
                     result = await runtime.latestImage(String(p.profileId), p.request, ctl.signal);
                     break;
+                case "imageSession":
+                    result = await runtime.imageSessionStatus();
+                    break;
+                case "clearChallenge":
+                    result = await runtime.clearBrowserChallenge(String(p.profileId), ctl.signal);
+                    break;
+                case "imageRoute":
+                    result = await runtime.inspectImageRoute(String(p.profileId), ctl.signal);
+                    break;
+                case "imageSessionBind":
+                    result = await runtime.bindImageSession(String(p.profileId), p.value, ctl.signal);
+                    break;
                 case "complete":
                     for await (const event of runtime.complete(String(p.profileId), p.completion, ctl.signal))
                         await send({ id, ...event });

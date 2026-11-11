@@ -240,6 +240,30 @@ export class BrowserBridge {
         checkAbort(signal);
         return await this.rawCall("imageLast", { profileId, request }, 180_000, signal);
     }
+    async imageSession(signal) {
+        checkAbort(signal);
+        await this.start();
+        checkAbort(signal);
+        return await this.rawCall("imageSession", {}, 60_000, signal);
+    }
+    async clearBrowserChallenge(profileId, signal) {
+        checkAbort(signal);
+        await this.start();
+        checkAbort(signal);
+        return await this.rawCall("clearChallenge", { profileId }, 120_000, signal);
+    }
+    async inspectImageRoute(profileId, signal) {
+        checkAbort(signal);
+        await this.start();
+        checkAbort(signal);
+        return await this.rawCall("imageRoute", { profileId }, this.options.loginTimeoutMs + 120_000, signal);
+    }
+    async bindImageSession(profileId, value, signal) {
+        checkAbort(signal);
+        await this.start();
+        checkAbort(signal);
+        return await this.rawCall("imageSessionBind", { profileId, value }, this.options.loginTimeoutMs + 120_000, signal);
+    }
     async close() {
         if (this.closed)
             return;

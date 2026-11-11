@@ -36,7 +36,9 @@
     "prepack": "npm run build",
     "image": "npm run build && node dist/cli.js image",
     "image:login": "npm run build && node dist/cli.js login",
-    "image:doctor": "npm run build && node dist/cli.js doctor"
+    "image:doctor": "npm run build && node dist/cli.js doctor",
+    "session": "npm run build && node dist/cli.js session",
+    "image:dry": "npm run build && node dist/cli.js image --dry-run"
   },
   "engines": {
     "node": ">=22"

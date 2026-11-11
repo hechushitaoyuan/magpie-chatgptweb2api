@@ -56,6 +56,10 @@ input.on("line", line => {
         case "status": result = await runtime.status(String(p.profileId), ctl.signal); break;
         case "image": result = await runtime.generateImage(String(p.profileId), p.request as ImageRequest, ctl.signal); break;
         case "imageLast": result = await runtime.latestImage(String(p.profileId), p.request as { outputDir: string; filename?: string }, ctl.signal); break;
+        case "imageSession": result = await runtime.imageSessionStatus(); break;
+        case "clearChallenge": result = await runtime.clearBrowserChallenge(String(p.profileId), ctl.signal); break;
+        case "imageRoute": result = await runtime.inspectImageRoute(String(p.profileId), ctl.signal); break;
+        case "imageSessionBind": result = await runtime.bindImageSession(String(p.profileId), p.value as string | undefined, ctl.signal); break;
         case "complete":
           for await (const event of runtime.complete(String(p.profileId), p.completion as Completion, ctl.signal)) await send({ id, ...event });
           break;
